@@ -4,12 +4,12 @@
 功能：
 1. /api/session - 创建会话（按角色维护对话历史）
 2. /api/chat    - 核心对话（LLM + Function Calling + 工具调用）
-3. /api/rewrite - 文案改写（标题/正文/标签优化）
+3. /api/chat/stream - 流式对话（SSE，逐字输出）
+4. /api/rewrite - 文案改写（标题/正文/标签优化）
 
 工具：
 - fetch_product_info: 抓取商品链接，提取名称/价格/卖点
 - search_trending_tags: 搜索小红书热门话题标签
-- analyze_image: 识别商品图片内容（预留）
 
 部署：
   pip install -r requirements.txt
@@ -18,13 +18,15 @@
 """
 
 import os
+import re
 import json
 import uuid
 import time
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
@@ -38,12 +40,12 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 MODEL = "deepseek-chat"  # DeepSeek-V3，支持 function calling
 
-app = FastAPI(title="种薯 Agent API", version="1.0.0")
+app = FastAPI(title="种薯 Agent API", version="2.0.0")
 
 # CORS - 允许前端跨域调用
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境改成具体域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -184,10 +186,6 @@ TOOLS = [
 # 工具实现
 # ══════════════════════════════════════════════════════════════
 async def fetch_product_info(url: str) -> str:
-    """
-    用 Jina Reader API 抓取商品页面内容。
-    Jina Reader 免费、不需要 API Key、支持 JS 渲染。
-    """
     jina_url = f"https://r.jina.ai/{url}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -199,7 +197,7 @@ async def fetch_product_info(url: str) -> str:
                 }
             )
             if resp.status_code == 200:
-                content = resp.text[:3000]  # 限制长度，避免 token 爆炸
+                content = resp.text[:3000]
                 return f"✅ 成功抓取商品页面内容：\n\n{content}"
             else:
                 return f"⚠️ 抓取失败（HTTP {resp.status_code}），请检查链接是否正确。将基于你的描述生成文案。"
@@ -208,11 +206,6 @@ async def fetch_product_info(url: str) -> str:
 
 
 async def search_trending_tags(keyword: str, category: str = "") -> str:
-    """
-    搜索热门标签。
-    当前实现：用 Jina Search 搜索小红书相关话题。
-    未来可接入新红数据/千瓜数据等专业 API。
-    """
     search_query = f"小红书 热门话题标签 {keyword} {category}".strip()
     jina_search_url = f"https://s.jina.ai/{search_query}"
     try:
@@ -222,17 +215,15 @@ async def search_trending_tags(keyword: str, category: str = "") -> str:
                 headers={"Accept": "text/plain"}
             )
             if resp.status_code == 200:
-                content = resp.text[:1500]  # 限制长度避免 token 过多
+                content = resp.text[:1500]
                 return f"✅ 搜索到与「{keyword}」相关的热门话题：\n\n{content}"
             else:
-                # 降级：返回通用建议
                 return _fallback_tags(keyword)
     except Exception:
         return _fallback_tags(keyword)
 
 
 def _fallback_tags(keyword: str) -> str:
-    """降级标签建议"""
     return f"""基于「{keyword}」的通用标签建议：
 高流量标签：#{keyword} #好物推荐 #真实测评 #分享日常
 精准人群标签：#{keyword}推荐 #{keyword}测评 #平价{keyword}
@@ -240,11 +231,18 @@ def _fallback_tags(keyword: str) -> str:
 建议每篇笔记选5-8个标签，高流量+精准混搭效果最好。"""
 
 
-# 工具调度器
 TOOL_HANDLERS = {
     "fetch_product_info": fetch_product_info,
     "search_trending_tags": search_trending_tags,
 }
+
+
+# ══════════════════════════════════════════════════════════════
+# SSE 辅助函数
+# ══════════════════════════════════════════════════════════════
+def sse_event(event: str, data: dict) -> str:
+    """格式化一条 SSE 事件"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -263,11 +261,11 @@ class ChatRequest(BaseModel):
 
 
 class RewriteRequest(BaseModel):
-    action: str  # "rewrite_title" / "rewrite_body" / "rewrite_tags" / "polish"
+    action: str
     title: Optional[str] = ""
     body: Optional[str] = ""
     tags: Optional[list] = []
-    instruction: Optional[str] = ""  # 用户的改写要求
+    instruction: Optional[str] = ""
 
 
 @app.post("/api/session")
@@ -288,81 +286,184 @@ async def create_session(req: SessionRequest):
     return {"session_id": session_id}
 
 
+# ── 原有非流式接口（保持兼容） ──────────────────────────────
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """
-    核心对话接口 - Agent ReAct 循环：
-    1. 用户消息加入历史
-    2. 调用 LLM（带 function calling）
-    3. 如果 LLM 决定调用工具 → 执行工具 → 把结果反馈给 LLM → 再次调用
-    4. 循环直到 LLM 直接回复用户
-    5. 解析回复，提取结构化笔记
-    """
     if req.session_id not in sessions:
         raise HTTPException(404, "会话不存在或已过期，请重新创建")
 
     session = sessions[req.session_id]
-
-    # 加入用户消息
     session["messages"].append({"role": "user", "content": req.message})
 
-    # Agent 循环（最多 5 轮工具调用，防止无限循环）
     max_tool_rounds = 5
+    assistant_text = ""
     for _ in range(max_tool_rounds):
-        # 调用 LLM
         llm_response = await call_deepseek(
             messages=session["messages"],
             tools=TOOLS,
         )
-
         choice = llm_response["choices"][0]
         message = choice["message"]
 
-        # 如果 LLM 决定调用工具
         if message.get("tool_calls"):
-            # 记录 assistant 的工具调用意图
             session["messages"].append(message)
-
-            # 执行每个工具调用
             for tool_call in message["tool_calls"]:
                 func_name = tool_call["function"]["name"]
                 func_args = json.loads(tool_call["function"]["arguments"])
-
-                # 执行工具
                 handler = TOOL_HANDLERS.get(func_name)
                 if handler:
                     result = await handler(**func_args)
                 else:
                     result = f"未知工具：{func_name}"
-
-                # 把工具结果加入历史
                 session["messages"].append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": result,
                 })
-
-            # 继续循环，让 LLM 看到工具结果后再决定
             continue
 
-        # LLM 直接回复用户（没有工具调用），退出循环
         assistant_text = message.get("content", "")
         session["messages"].append({"role": "assistant", "content": assistant_text})
         break
     else:
-        # 超过最大轮数，强制结束
         assistant_text = "抱歉，处理过程太复杂了，请简化你的需求再试一次。"
 
-    # 解析回复：尝试提取结构化笔记
-    response = parse_agent_response(assistant_text)
-    return response
+    return parse_agent_response(assistant_text)
+
+
+# ── 新增：流式对话接口（SSE） ──────────────────────────────
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    流式对话接口 - SSE (Server-Sent Events)
+    事件类型:
+    - tool_start: 开始调用工具 {name, args}
+    - tool_done:  工具调用完成 {name, result_preview}
+    - delta:      文本增量 {content}
+    - done:       完成 {full_text}
+    - error:      出错 {message}
+    """
+    if req.session_id not in sessions:
+        async def error_gen():
+            yield sse_event("error", {"message": "会话不存在或已过期，请重新创建"})
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    session = sessions[req.session_id]
+    session["messages"].append({"role": "user", "content": req.message})
+
+    async def stream_generator() -> AsyncGenerator[str, None]:
+        try:
+            # Phase 1: Agent 工具调用循环（非流式，但发事件通知前端）
+            max_tool_rounds = 5
+            for _ in range(max_tool_rounds):
+                llm_response = await call_deepseek(
+                    messages=session["messages"],
+                    tools=TOOLS,
+                    stream=False,
+                )
+                choice = llm_response["choices"][0]
+                message = choice["message"]
+
+                if not message.get("tool_calls"):
+                    break  # 没有工具调用，进入流式生成阶段
+
+                session["messages"].append(message)
+                for tool_call in message["tool_calls"]:
+                    func_name = tool_call["function"]["name"]
+                    func_args = json.loads(tool_call["function"]["arguments"])
+
+                    # 通知前端：开始调用工具
+                    yield sse_event("tool_start", {
+                        "name": func_name,
+                        "args": func_args,
+                    })
+
+                    handler = TOOL_HANDLERS.get(func_name)
+                    if handler:
+                        result = await handler(**func_args)
+                    else:
+                        result = f"未知工具：{func_name}"
+
+                    session["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": result,
+                    })
+
+                    # 通知前端：工具调用完成
+                    yield sse_event("tool_done", {
+                        "name": func_name,
+                        "result_preview": result[:100],
+                    })
+            else:
+                yield sse_event("delta", {"content": "抱歉，处理过程太复杂了，请简化你的需求再试一次。"})
+                yield sse_event("done", {"full_text": ""})
+                return
+
+            # Phase 2: 流式生成最终回复
+            full_text = ""
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                payload = {
+                    "model": MODEL,
+                    "messages": session["messages"],
+                    "temperature": 0.8,
+                    "max_tokens": 2000,
+                    "stream": True,
+                }
+
+                async with client.stream(
+                    "POST",
+                    f"{DEEPSEEK_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_text = await resp.aread()
+                        yield sse_event("error", {"message": f"DeepSeek API 错误：{resp.status_code}"})
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                full_text += content
+                                yield sse_event("delta", {"content": content})
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+            # 保存到会话历史
+            session["messages"].append({"role": "assistant", "content": full_text})
+
+            # 发送完成事件（包含完整文本，前端用于最终解析笔记结构）
+            yield sse_event("done", {"full_text": full_text})
+
+        except Exception as e:
+            yield sse_event("error", {"message": str(e)})
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁止 Nginx/Render 代理缓冲
+        },
+    )
 
 
 @app.post("/api/rewrite")
 async def rewrite(req: RewriteRequest):
-    """
-    文案改写接口 - 对已生成的笔记做局部优化
-    """
     action_prompts = {
         "rewrite_title": f"请为以下笔记重新生成5个更有吸引力的标题备选：\n\n原标题：{req.title}\n正文摘要：{req.body[:200]}",
         "rewrite_body": f"请优化以下笔记正文，使其更符合小红书调性，更有感染力：\n\n标题：{req.title}\n原文：{req.body}\n\n用户要求：{req.instruction or '优化语言表达，增加真实感'}",
@@ -391,10 +492,9 @@ async def rewrite(req: RewriteRequest):
 
 
 # ══════════════════════════════════════════════════════════════
-# LLM 调用
+# LLM 调用（非流式，用于工具调用阶段）
 # ══════════════════════════════════════════════════════════════
-async def call_deepseek(messages: list, tools: Optional[list] = None) -> dict:
-    """调用 DeepSeek API（兼容 OpenAI 格式）"""
+async def call_deepseek(messages: list, tools: Optional[list] = None, stream: bool = False) -> dict:
     if not DEEPSEEK_API_KEY:
         raise HTTPException(500, "未配置 DEEPSEEK_API_KEY，请在 .env 文件中设置")
 
@@ -406,7 +506,7 @@ async def call_deepseek(messages: list, tools: Optional[list] = None) -> dict:
     }
     if tools:
         payload["tools"] = tools
-        payload["tool_choice"] = "auto"  # 让模型自己决定是否调用工具
+        payload["tool_choice"] = "auto"
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
@@ -429,18 +529,8 @@ async def call_deepseek(messages: list, tools: Optional[list] = None) -> dict:
 # 响应解析
 # ══════════════════════════════════════════════════════════════
 def parse_agent_response(text: str) -> dict:
-    """
-    尝试从 LLM 回复中提取结构化笔记。
-    LLM 可能返回：
-    1. 纯 JSON（理想情况）
-    2. Markdown 包裹的 JSON（```json ... ```）
-    3. 带有自然语言 + JSON 混合的文本
-    4. 纯文本（没有笔记，只是对话）
-    """
-    # 尝试提取 JSON
     note_preview = None
 
-    # 方法1：整体是 JSON
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "note" in data:
@@ -449,8 +539,6 @@ def parse_agent_response(text: str) -> dict:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # 方法2：从 ```json ``` 块中提取
-    import re
     json_match = re.search(r'```json\s*\n?(.*?)\n?```', text, re.DOTALL)
     if json_match:
         try:
@@ -462,7 +550,6 @@ def parse_agent_response(text: str) -> dict:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # 方法3：从文本中找 {"note": ...} 模式
     json_match = re.search(r'\{[^{}]*"note"\s*:\s*\{.*?\}\s*\}', text, re.DOTALL)
     if json_match:
         try:
@@ -474,7 +561,6 @@ def parse_agent_response(text: str) -> dict:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # 方法4：纯文本回复
     return {"text": text, "note": None}
 
 
