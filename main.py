@@ -436,19 +436,26 @@ async def chat_stream(req: ChatRequest):
 @app.post("/api/rewrite")
 async def rewrite(req: RewriteRequest):
     action_prompts = {
-        "rewrite_title": f"请为以下笔记重新生成5个更有吸引力的标题备选：\n\n原标题：{req.title}\n正文摘要：{req.body[:200]}",
-        "rewrite_body": f"请优化以下笔记正文，使其更符合小红书调性，更有感染力：\n\n标题：{req.title}\n原文：{req.body}\n\n用户要求：{req.instruction or '优化语言表达，增加真实感'}",
-        "rewrite_tags": f"请为以下笔记重新推荐10个更精准的话题标签：\n\n标题：{req.title}\n正文：{req.body[:300]}\n原标签：{', '.join(req.tags or [])}",
-        "polish": f"请全面润色以下笔记（标题+正文+标签都优化）：\n\n标题：{req.title}\n正文：{req.body}\n标签：{', '.join(req.tags or [])}\n\n用户要求：{req.instruction or '整体提升质量'}",
+        "rewrite_title": f"改写这个标题，要求：{req.instruction or '更有吸引力'}\n原标题：{req.title}\n正文参考：{req.body[:100]}",
+        "rewrite_body": f"改写正文，要求：{req.instruction or '优化表达'}\n标题：{req.title}\n原文：{req.body}\n注意：正文必须≤70字，4句短句用换行分隔",
+        "rewrite_tags": f"重新推荐5-8个标签：\n标题：{req.title}\n正文：{req.body[:200]}\n原标签：{', '.join(req.tags or [])}",
+        "polish": f"全面润色（标题+正文+标签）：\n标题：{req.title}\n正文：{req.body}\n标签：{', '.join(req.tags or [])}\n要求：{req.instruction or '整体提升'}\n注意：正文必须≤70字",
     }
 
     prompt = action_prompts.get(req.action)
     if not prompt:
         raise HTTPException(400, f"不支持的改写动作：{req.action}")
 
-    system_msg = """你是小红书文案优化专家。根据用户要求优化笔记内容。
-必须返回 JSON 格式：{"text": "你的优化说明", "note": {"title": "新标题", "body": "新正文", "tags": ["新标签1", ...]}}
-如果只改写标题，body和tags保持原文；如果只改标签，title和body保持原文。"""
+    system_msg = """你是小红书文案改写专家。直接返回改写结果，不要解释思路。
+
+██ 规则 ██
+1. 只返回JSON，不要有任何其他文字
+2. text字段留空
+3. 改写哪个字段就改哪个，其他保持原文
+4. body正文必须≤70字，4句短句，用\\n分隔
+
+输出格式：
+{"text":"","note":{"title":"改后标题","body":"改后正文","tags":["#标签1","#标签2"]}}"""
 
     llm_response = await call_deepseek(
         messages=[
