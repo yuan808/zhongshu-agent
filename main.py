@@ -463,6 +463,7 @@ async def rewrite(req: RewriteRequest):
     action_prompts = {
         "rewrite_title": f"改写这个标题，要求：{req.instruction or '更有吸引力'}\n原标题：{req.title}\n正文参考：{req.body[:100]}",
         "rewrite_body": f"改写正文，要求：{req.instruction or '优化表达'}\n标题：{req.title}\n原文：{req.body}\n注意：正文必须≤75字，4句短句用换行分隔，纯文字+emoji，不许有markdown或*符号",
+        "rewrite_sentence": f"改写这一句话，要求：{req.instruction or '换个说法'}\n原句：{req.body}\n注意：只返回改写后的一句话，不要扩写成多句，保持一句话，≤20字，纯文字+emoji，不许有markdown或*符号",
         "rewrite_tags": f"重新推荐5-8个标签：\n标题：{req.title}\n正文：{req.body[:200]}\n原标签：{', '.join(req.tags or [])}",
         "polish": f"全面润色（标题+正文+标签）：\n标题：{req.title}\n正文：{req.body}\n标签：{', '.join(req.tags or [])}\n要求：{req.instruction or '整体提升'}\n注意：正文必须≤75字，纯文字+emoji，不许有markdown或*符号",
     }
@@ -483,7 +484,8 @@ async def rewrite(req: RewriteRequest):
 1. 只返回JSON，不要有任何其他文字
 2. text字段留空
 3. 改写哪个字段就改哪个，其他保持原文
-4. body正文必须≤75字，4句短句，用\\n分隔
+4. body正文整体改写时：≤75字，4句短句，用\\n分隔
+5. 单句改写时（rewrite_sentence）：只返回一句话放在body里，≤20字，绝对不要扩写成多句
 
 输出格式：
 {"text":"","note":{"title":"改后标题","body":"改后正文","tags":["#标签1","#标签2"]}}"""
